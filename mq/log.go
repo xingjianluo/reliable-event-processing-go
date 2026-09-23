@@ -11,7 +11,7 @@ type stdLogger struct {
 }
 
 func newDefaultLogger() Logger {
-	return &stdLogger{l: log.New(os.Stdout, "[mq] ", log.LstdFlags|log.Lmicroseconds)}
+	return &stdLogger{l: log.New(os.Stderr, "[mq] ", log.LstdFlags|log.Lmicroseconds)}
 }
 
 func (s *stdLogger) Printf(format string, args ...any) {
