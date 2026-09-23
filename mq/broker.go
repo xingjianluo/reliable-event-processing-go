@@ -42,8 +42,7 @@ type Broker struct {
 	// 消费组。
 	groups map[string]*groupState
 
-	closed      bool
-	stopCh      chan struct{}
+	closed        bool
 	closeDeadline time.Time
 	wg          sync.WaitGroup // 所有 runner goroutine
 }
@@ -108,7 +107,6 @@ func OpenBroker(cfg Config) (*Broker, error) {
 		keySeq:   map[string]int64{},
 		dedup:    map[string]string{},
 		groups:   map[string]*groupState{},
-		stopCh:   make(chan struct{}),
 	}
 	if err := b.replay(); err != nil {
 		w.Close()
@@ -369,8 +367,10 @@ func (b *Broker) leaveConsumer(group, consumer string) error {
 	delete(g.consumers, consumer)
 	b.log.Printf("UNSUBSCRIBE-DONE group=%s consumer=%s remaining=%d",
 		group, consumer, len(g.consumers))
-	for key := range g.runners {
-		b.wakeLocked(g, key)
+	// 无条件强制唤醒：归属映射已改变，所有 runner 必须重新评估，
+	// 即使之前的关闭信号已被消费也不能漏。
+	for _, r := range g.runners {
+		r.cond.Signal()
 	}
 	b.mu.Unlock()
 	return nil
@@ -410,7 +410,12 @@ func (b *Broker) Close() error {
 	}
 	b.closed = true
 	b.closeDeadline = time.Now().Add(b.cfg.ShutdownTimeout)
-	close(b.stopCh)
+	// 唤醒所有在 cond 上等待的空闲 runner，使其观察到 closed 并退出。
+	for _, g := range b.groups {
+		for _, r := range g.runners {
+			r.cond.Broadcast()
+		}
+	}
 	b.log.Printf("CLOSE begin: shutdownTimeout=%s, waiting in-flight", b.cfg.ShutdownTimeout)
 	b.mu.Unlock()
 
@@ -437,7 +442,14 @@ func (g *groupState) ownerOf(key string) *consumerHandle {
 	}
 	ids := make([]string, 0, len(g.consumers))
 	for id := range g.consumers {
+		// 正在缩容的消费者不再接收“下一条”消息，但允许其在途消息跑完。
+		if g.consumers[id].closing {
+			continue
+		}
 		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 	sort.Strings(ids)
 	h := fnv.New32a()

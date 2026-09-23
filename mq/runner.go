@@ -2,6 +2,7 @@ package mq
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -12,15 +13,16 @@ import (
 // 归属（owner）只决定“下一条”消息由哪个消费者处理器执行；
 // 已经在途的消息允许原处理器跑完并落盘裁决，避免无谓重投。
 //
-// 唤醒模型：每 runner 一个容量 1 的 wake channel + pendingWake 标志，
-// 保证任意多次状态变更至少有一个待处理唤醒（不丢信号、也不溢出）。
+// 唤醒模型：使用以 b.mu 为锁的 sync.Cond。所有状态变更与 signal
+// 都在持有 b.mu 时完成，runner 在持锁状态下调用 cond.Wait（原子地
+// 释放锁并进入等待）。因此“发布/缩容/重试到期”等事件不可能在
+// runner 检查状态与进入等待之间丢失。
 type runner struct {
 	b   *Broker
 	g   *groupState
 	key string
 
-	wake        chan struct{}
-	pendingWake bool
+	cond *sync.Cond
 
 	inflight        *msgState
 	decisionCh      chan Decision
@@ -37,32 +39,21 @@ func (b *Broker) ensureRunnerLocked(g *groupState, key string) {
 		b:    b,
 		g:    g,
 		key:  key,
-		wake: make(chan struct{}, 1),
+		cond: sync.NewCond(&b.mu),
 	}
 	g.runners[key] = r
 	b.wg.Add(1)
 	go r.run()
 }
 
-// wakeLocked 标记一次待处理唤醒并非阻塞发送信号。调用方持有 b.mu。
+// wakeLocked 唤醒等待中的 runner。调用方必须持有 b.mu。
 func (b *Broker) wakeLocked(g *groupState, key string) {
 	r := g.runners[key]
 	if r == nil {
 		b.ensureRunnerLocked(g, key)
 		r = g.runners[key]
 	}
-	r.signalLocked()
-}
-
-func (r *runner) signalLocked() {
-	if r.pendingWake {
-		return
-	}
-	r.pendingWake = true
-	select {
-	case r.wake <- struct{}{}:
-	default:
-	}
+	r.cond.Signal()
 }
 
 func (r *runner) logf(format string, args ...any) {
@@ -72,22 +63,23 @@ func (r *runner) logf(format string, args ...any) {
 func (r *runner) run() {
 	defer r.b.wg.Done()
 	var timer *time.Timer
-	var timerStop chan struct{} // 非 nil 表示当前有重试计时 goroutine
-	var timerFired bool
+	var timerCancel chan struct{} // close 以取消计时 goroutine
+
 	cancelTimer := func() {
-		if timerStop != nil {
-			close(timerStop)
-			timerStop = nil
+		if timerCancel != nil {
+			close(timerCancel)
+			timerCancel = nil
 		}
 		if timer != nil {
 			timer.Stop()
 			timer = nil
 		}
-		timerFired = false
 	}
 
 	for {
 		r.b.mu.Lock()
+
+		// 关闭且无在途：退出。
 		if r.b.closed && r.inflight == nil {
 			cancelTimer()
 			r.b.mu.Unlock()
@@ -95,26 +87,18 @@ func (r *runner) run() {
 			return
 		}
 
-		// 消费掉进入本轮前的待处理唤醒标志（决策到达会重新置位）。
-		r.pendingWake = false
-		select {
-		case <-r.wake:
-		default:
-		}
-
 		if r.inflight == nil && !r.b.closed {
-			r.tryDeliverLocked(&timer, &timerStop, &timerFired)
+			r.tryDeliverLocked(&timer, &timerCancel)
 		} else {
 			cancelTimer()
 		}
 
-		decCh := r.decisionCh
-		force := r.b.baseCtx.Done()
-		wake := r.wake
-		r.b.mu.Unlock()
-
-		if decCh != nil {
-			// 在途：等待处理器裁决或强制取消。
+		if r.inflight != nil {
+			// 在途：在锁内等待处理器裁决（decisionCh 由处理 goroutine
+			// 在持锁状态变更前写入；这里用一个解锁窗口等待它）。
+			decCh := r.decisionCh
+			force := r.b.baseCtx.Done()
+			r.b.mu.Unlock()
 			select {
 			case dec := <-decCh:
 				r.handleDecision(dec)
@@ -126,64 +110,69 @@ func (r *runner) run() {
 			continue
 		}
 
-		// 空闲：等待状态变更唤醒（新消息、归属变化、重试到期、关闭）。
-		select {
-		case <-wake:
-		case <-force:
-			r.logf("RUNNER stop (forced)")
-			return
+		// 空闲：在锁内等待状态变化或关闭。重试计时 goroutine 会在到期时
+		// 持锁 Broadcast；发布/缩容/关闭同样在持锁时 Signal/Broadcast。
+		// cond.Wait 原子地释放锁并等待，因此信号不可能在“检查状态之后、
+		// 进入等待之前”丢失。
+		for !r.b.closed && !r.hasWorkLocked() {
+			r.cond.Wait()
 		}
+		r.b.mu.Unlock()
 	}
 }
 
-// armRetryTimer 启动一个一次性 goroutine 管理重试计时。
-// 该 goroutine 是 timer.C 的唯一读取者；到期后在持锁状态下唤醒主循环，
-// 因此主循环从不直接消费 timer.C，避免与本 goroutine 竞争同一个 tick。
-func (r *runner) armRetryTimer(d time.Duration,
-	timer **time.Timer, timerStop *chan struct{}, timerFired *bool) {
-	stop := make(chan struct{})
+// hasWorkLocked 判断是否应结束等待重新评估：关闭、有立即可投递消息、
+// 或已安排的重试计时已经到期。
+func (r *runner) hasWorkLocked() bool {
+	if r.b.closed {
+		return true
+	}
+	if owner := r.g.ownerOf(r.key); owner == nil {
+		return false
+	}
+	now := time.Now()
+	for _, ms := range r.g.keyMsgs[r.key] {
+		if ms.status == stAcked || ms.status == stDead {
+			continue
+		}
+		if ms.status == stInflight {
+			return true
+		}
+		if !ms.notBefore.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// armRetryTimer 安排一个一次性 goroutine 在 d 后唤醒 runner。
+func (r *runner) armRetryTimer(d time.Duration, timer **time.Timer, timerCancel *chan struct{}) {
+	cancel := make(chan struct{})
 	t := time.NewTimer(d)
 	*timer = t
-	*timerStop = stop
-	*timerFired = false
+	*timerCancel = cancel
 	go func() {
 		select {
 		case <-t.C:
 			r.b.mu.Lock()
-			defer r.b.mu.Unlock()
-			if *timerFired {
-				return
-			}
-			*timerFired = true
-			// 定时到期必须保证唤醒即使在主循环“刚清标志尚未阻塞”的
-			// 窗口里也不丢：置标志并入队 wake。
-			r.pendingWake = true
-			select {
-			case r.wake <- struct{}{}:
-			default:
-			}
-		case <-stop:
+			r.cond.Broadcast()
+			r.b.mu.Unlock()
+		case <-cancel:
 		case <-r.b.baseCtx.Done():
 		}
 	}()
 }
 
-// tryDeliverLocked 尝试投递下一条可处理消息；若只能等待重试则安排计时器。
-func (r *runner) tryDeliverLocked(
-	timer **time.Timer, timerStop *chan struct{}, timerFired *bool,
-) {
-	// 若已有计时器且尚未触发，则维持当前等待；触发过则清理后重算。
+// tryDeliverLocked 尝试投递下一条消息，或安排重试计时。
+func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}) {
+	// 清理上一轮计时器（若有）。
+	if *timerCancel != nil {
+		close(*timerCancel)
+		*timerCancel = nil
+	}
 	if *timer != nil {
-		if !*timerFired {
-			return
-		}
-		if *timerStop != nil {
-			close(*timerStop)
-			*timerStop = nil
-		}
 		(*timer).Stop()
 		*timer = nil
-		*timerFired = false
 	}
 
 	owner := r.g.ownerOf(r.key)
@@ -253,8 +242,7 @@ func (r *runner) tryDeliverLocked(
 		if d < 0 {
 			d = 0
 		}
-		r.armRetryTimer(d, timer, timerStop, timerFired)
-		return
+		r.armRetryTimer(d, timer, timerCancel)
 	}
 }
 
@@ -281,7 +269,7 @@ func (r *runner) handleDecision(dec Decision) {
 
 	if ms.status != stInflight {
 		r.logf("DECISION-IGNORE id=%s seq=%d status=%s (stale)", ms.id, ms.seq, ms.status)
-		r.signalLocked()
+		r.cond.Signal()
 		return
 	}
 
@@ -290,14 +278,14 @@ func (r *runner) handleDecision(dec Decision) {
 		if _, err := r.b.w.Append(kindAcked, mustJSON(&ev)); err != nil {
 			r.logf("ACK-PERSIST-FAIL id=%s err=%v -> pending redelivery", ms.id, err)
 			ms.status = stPending
-			r.signalLocked()
+			r.cond.Signal()
 			return
 		}
 		ms.status = stAcked
 		r.logf("ACK id=%s seq=%d attempt=%d status: inflight->acked",
 			ms.id, ms.seq, ms.attempts)
 		r.compactLocked()
-		r.signalLocked()
+		r.cond.Signal()
 		return
 	}
 
@@ -314,7 +302,7 @@ func (r *runner) handleDecision(dec Decision) {
 		if _, err := r.b.w.Append(kindDead, mustJSON(&ev)); err != nil {
 			r.logf("DEAD-PERSIST-FAIL id=%s err=%v -> pending redelivery", ms.id, err)
 			ms.status = stPending
-			r.signalLocked()
+			r.cond.Signal()
 			return
 		}
 		ms.status = stDead
@@ -325,7 +313,7 @@ func (r *runner) handleDecision(dec Decision) {
 		r.logf("DEAD id=%s seq=%d attempt=%d reason=%s err=%q status: inflight->dead",
 			ms.id, ms.seq, ms.attempts, reason, ms.errMsg)
 		r.compactLocked()
-		r.signalLocked()
+		r.cond.Signal()
 		return
 	}
 
@@ -349,14 +337,14 @@ func (r *runner) handleDecision(dec Decision) {
 	if _, err := r.b.w.Append(kindNacked, mustJSON(&ev)); err != nil {
 		r.logf("NACK-PERSIST-FAIL id=%s err=%v -> retry immediately", ms.id, err)
 		ms.status = stPending
-		r.signalLocked()
+		r.cond.Signal()
 		return
 	}
 	ms.status = stPending
 	ms.notBefore = notBefore
 	r.logf("NACK id=%s seq=%d attempt=%d retryIn=%s err=%q status: inflight->pending",
 		ms.id, ms.seq, ms.attempts, delay, ms.errMsg)
-	r.signalLocked()
+	r.cond.Signal()
 }
 
 // revokeInflight 在关闭超时等场景把在途消息收回为 pending（不落盘确认）。
@@ -402,14 +390,4 @@ func errText(err error) string {
 		return ""
 	}
 	return err.Error()
-}
-
-// stopTimer 停止定时器并排空其 channel 中可能残留的到期值。
-func stopTimer(t *time.Timer) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
 }
