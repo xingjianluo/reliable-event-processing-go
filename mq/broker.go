@@ -364,11 +364,18 @@ func (b *Broker) leaveConsumer(group, consumer string) error {
 		time.Sleep(2 * time.Millisecond)
 	}
 	b.mu.Lock()
+	timedOut := false
+	// 超时仍在途：取消其处理器 context 并收回消息为 pending，避免状态悬挂。
+	for _, r := range g.runners {
+		if r.handlerConsumer == consumer && r.inflight != nil {
+			timedOut = true
+			r.revokeInflightLocked("consumer-removal-timeout")
+		}
+	}
 	delete(g.consumers, consumer)
-	b.log.Printf("UNSUBSCRIBE-DONE group=%s consumer=%s remaining=%d",
-		group, consumer, len(g.consumers))
-	// 无条件强制唤醒：归属映射已改变，所有 runner 必须重新评估，
-	// 即使之前的关闭信号已被消费也不能漏。
+	b.log.Printf("UNSUBSCRIBE-DONE group=%s consumer=%s remaining=%d timedOut=%v",
+		group, consumer, len(g.consumers), timedOut)
+	// 归属映射已改变，唤醒所有 runner 重新评估。
 	for _, r := range g.runners {
 		r.cond.Signal()
 	}
@@ -432,6 +439,27 @@ func (b *Broker) Close() error {
 	b.mu.Lock()
 	b.cancel()
 	b.mu.Unlock()
+	return b.w.Close()
+}
+
+// crashForTest 模拟进程被硬杀死：不等待在途、不优雅落盘业务确认，
+// 仅停止消费循环、取消处理器并关闭 WAL。已 fsync 的事件保留，
+// 未确认的在途消息重启后按 pending 重投。仅供测试使用。
+func (b *Broker) crashForTest() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	for _, g := range b.groups {
+		for _, r := range g.runners {
+			r.cond.Broadcast()
+		}
+	}
+	b.cancel()
+	b.mu.Unlock()
+	b.wg.Wait()
 	return b.w.Close()
 }
 

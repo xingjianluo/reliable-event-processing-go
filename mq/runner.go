@@ -26,6 +26,7 @@ type runner struct {
 
 	inflight        *msgState
 	decisionCh      chan Decision
+	revokeCh        chan struct{} // 每次投递新建；revoke 时关闭以解除在途等待
 	cancelDelivery  context.CancelFunc
 	sem             chan struct{}
 	handlerConsumer string
@@ -94,18 +95,28 @@ func (r *runner) run() {
 		}
 
 		if r.inflight != nil {
-			// 在途：在锁内等待处理器裁决（decisionCh 由处理 goroutine
-			// 在持锁状态变更前写入；这里用一个解锁窗口等待它）。
+			// 在途：用解锁窗口等待处理器裁决、缩容收回或关闭强制取消。
 			decCh := r.decisionCh
+			revokeCh := r.revokeCh
 			force := r.b.baseCtx.Done()
 			r.b.mu.Unlock()
 			select {
 			case dec := <-decCh:
 				r.handleDecision(dec)
+			case <-revokeCh:
+				// 在途消息已在 revokeInflightLocked 中收回为 pending；
+				// 直接回到循环顶部，由新归属重新投递。
 			case <-force:
-				r.revokeInflight("shutdown-timeout")
-				r.logf("RUNNER stop (forced); in-flight reset pending for redelivery")
-				return
+				// baseCtx 取消只可能发生在 Broker.Close。
+				r.b.mu.Lock()
+				closed := r.b.closed
+				r.b.mu.Unlock()
+				if closed {
+					r.revokeInflight("shutdown-timeout")
+					r.logf("RUNNER stop (forced); in-flight reset pending for redelivery")
+					return
+				}
+				r.revokeInflight("unexpected-cancel")
 			}
 			continue
 		}
@@ -215,6 +226,7 @@ func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}
 		ctx, cancel := context.WithCancel(r.b.baseCtx)
 		ch := make(chan Decision, 1)
 		r.decisionCh = ch
+		r.revokeCh = make(chan struct{})
 		r.cancelDelivery = cancel
 
 		d := &Delivery{
@@ -257,6 +269,7 @@ func (r *runner) handleDecision(dec Decision) {
 	}
 	r.inflight = nil
 	r.decisionCh = nil
+	r.revokeCh = nil
 	if r.sem != nil {
 		<-r.sem
 		r.sem = nil
@@ -351,6 +364,11 @@ func (r *runner) handleDecision(dec Decision) {
 func (r *runner) revokeInflight(cause string) {
 	r.b.mu.Lock()
 	defer r.b.mu.Unlock()
+	r.revokeInflightLocked(cause)
+}
+
+// revokeInflightLocked 是 revokeInflight 的持锁版本。调用方必须持有 b.mu。
+func (r *runner) revokeInflightLocked(cause string) {
 	ms := r.inflight
 	if ms == nil {
 		return
@@ -364,6 +382,10 @@ func (r *runner) revokeInflight(cause string) {
 		r.cancelDelivery = nil
 	}
 	r.decisionCh = nil
+	if r.revokeCh != nil {
+		close(r.revokeCh) // 解除在途 select 的等待
+		r.revokeCh = nil
+	}
 	if r.sem != nil {
 		<-r.sem
 		r.sem = nil
@@ -371,6 +393,8 @@ func (r *runner) revokeInflight(cause string) {
 	r.handlerConsumer = ""
 	r.logf("REVOKE id=%s seq=%d cause=%s -> pending (at-least-once redelivery)",
 		ms.id, ms.seq, cause)
+	// 消息已回到 pending：唤醒本 runner 立即重新评估 / 重新投递。
+	r.cond.Signal()
 }
 
 // compactLocked 裁剪路由键队列开头连续的终态消息，控制内存增长。

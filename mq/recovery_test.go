@@ -90,13 +90,10 @@ func TestRestartInflightRedelivered(t *testing.T) {
 	}
 	waitFor(t, func() bool { return entered.Load() == 2 }, time.Second, "2 in-flight")
 
-	// 模拟硬崩溃：不等待在途，直接关闭底层 WAL（跳过优雅 Close）。
-	// 这 2 条的确认从未落盘。
+	// 模拟硬崩溃：不等待在途、不优雅落盘，直接终止消费循环并关闭 WAL。
+	// 这 2 条的确认从未落盘；fsync 过的发布事件保留。
 	c.closed = true // 避免 c.Close 优雅等待
-	b.mu.Lock()
-	b.cancel()
-	b.mu.Unlock()
-	if err := b.w.Close(); err != nil {
+	if err := b.crashForTest(); err != nil {
 		t.Fatal(err)
 	}
 
