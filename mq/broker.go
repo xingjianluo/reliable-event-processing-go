@@ -27,11 +27,11 @@ const (
 // Broker 是本地可靠消息代理：负责持久化、按路由键排序、
 // 消费组分发、重试调度与死信管理。
 type Broker struct {
-	cfg    Config
-	w      *wal.WAL
-	log    Logger
+	cfg     Config
+	w       *wal.WAL
+	log     Logger
 	baseCtx context.Context
-	cancel context.CancelFunc
+	cancel  context.CancelFunc
 
 	mu sync.Mutex
 	// 消息主体（负载只存一份）。
@@ -42,9 +42,8 @@ type Broker struct {
 	// 消费组。
 	groups map[string]*groupState
 
-	closed        bool
-	closeDeadline time.Time
-	wg          sync.WaitGroup // 所有 runner goroutine
+	closed bool
+	wg     sync.WaitGroup // 所有 runner goroutine
 }
 
 type storedMessage struct {
@@ -416,7 +415,6 @@ func (b *Broker) Close() error {
 		return nil
 	}
 	b.closed = true
-	b.closeDeadline = time.Now().Add(b.cfg.ShutdownTimeout)
 	// 唤醒所有在 cond 上等待的空闲 runner，使其观察到 closed 并退出。
 	for _, g := range b.groups {
 		for _, r := range g.runners {

@@ -171,10 +171,10 @@ func TestDuplicateAckOnlyOnce(t *testing.T) {
 	eff := newEffects()
 	c, _ := b.Subscribe("g", "c1", func(ctx context.Context, d *Delivery) Decision {
 		eff.mark(d.ID())
-		d.Ack()          // 显式确认
-		d.Ack()          // 重复确认，必须忽略
+		d.Ack()                                           // 显式确认
+		d.Ack()                                           // 重复确认，必须忽略
 		d.Nack(NackOptions{Err: errors.New("late nack")}) // 确认后的拒绝，必须忽略
-		return AckDecision() // 返回的裁决也必须被忽略
+		return AckDecision()                              // 返回的裁决也必须被忽略
 	})
 	defer c.Close()
 

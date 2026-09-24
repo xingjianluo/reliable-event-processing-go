@@ -18,19 +18,19 @@ type groupRegEvent struct {
 
 // publishedEvent: 一条消息发布。payload 存一次，按 (key,seq) 引用。
 type publishedEvent struct {
-	ID      string `json:"id"`
-	Key     string `json:"key"`
-	Seq     int64  `json:"seq"`
+	ID       string `json:"id"`
+	Key      string `json:"key"`
+	Seq      int64  `json:"seq"`
 	DedupKey string `json:"dedup,omitempty"`
-	Payload []byte `json:"p"`
+	Payload  []byte `json:"p"`
 }
 
 // groupEvent 是针对某消费组的状态变更（确认/拒绝/死信）。
 type groupEvent struct {
-	Group   string `json:"g"`
-	ID      string `json:"id"`
-	Key     string `json:"k"`
-	Seq     int64  `json:"s"`
+	Group     string `json:"g"`
+	ID        string `json:"id"`
+	Key       string `json:"k"`
+	Seq       int64  `json:"s"`
 	Attempt   int    `json:"a,omitempty"`  // 拒绝/死信时已发生的尝试次数
 	Reason    string `json:"r,omitempty"`  // 死信原因
 	ErrMsg    string `json:"e,omitempty"`  // 失败描述

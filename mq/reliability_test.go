@@ -17,8 +17,8 @@ func TestRetryThenSuccess(t *testing.T) {
 
 	eff := newEffects()
 	var (
-		attMu         sync.Mutex
-		attemptsSeen  []int
+		attMu        sync.Mutex
+		attemptsSeen []int
 	)
 	c, _ := b.Subscribe("g", "c1", func(ctx context.Context, d *Delivery) Decision {
 		if d.Attempt() < 3 {
