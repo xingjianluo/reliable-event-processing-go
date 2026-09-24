@@ -48,7 +48,8 @@ func TestConsumerScaleOutAndIn(t *testing.T) {
 	}
 
 	waitFor(t, func() bool { return eff.total() == 90 }, 5*time.Second, "all 90 processed across scale changes")
-	time.Sleep(60 * time.Millisecond)
+	// 等待框架确认全部落盘后再检查状态（业务先生效、ACK 后落盘）。
+	waitGroupDrained(t, b, "g", 5*time.Second)
 	if eff.total() != 90 {
 		t.Fatalf("total effects=%d want 90", eff.total())
 	}

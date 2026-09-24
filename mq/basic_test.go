@@ -180,14 +180,8 @@ func TestDuplicateAckOnlyOnce(t *testing.T) {
 
 	res, _ := b.Publish(context.Background(), Message{Key: "k"}, PublishOptions{})
 	waitFor(t, func() bool { return eff.total() == 1 }, time.Second, "processed")
-	time.Sleep(50 * time.Millisecond)
 	if eff.count(res.ID) != 1 {
 		t.Fatalf("message applied %d times, want 1", eff.count(res.ID))
 	}
-	b.mu.Lock()
-	st := b.groups["g"].byID[res.ID].status
-	b.mu.Unlock()
-	if st != stAcked {
-		t.Fatalf("status = %s, want acked", st)
-	}
+	waitStatus(t, b, "g", res.ID, stAcked, time.Second)
 }

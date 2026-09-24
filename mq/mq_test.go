@@ -58,3 +58,30 @@ func testConfig(t *testing.T, dir string) Config {
 		Logger:             testLogger{t},
 	}
 }
+
+// waitStatus 等待某消息在指定消费组到达目标状态（用于等待框架确认/死信落盘，
+// 避免在“业务已生效但 ACK 尚未落盘”的窗口里读到 inflight）。
+func waitStatus(t *testing.T, b *Broker, group, id, want string, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		ms := b.groups[group].byID[id]
+		return ms != nil && ms.status == want
+	}, timeout, "status="+want+" for "+id)
+}
+
+// waitGroupDrained 等待某消费组所有路由键的消息都进入终态（队列被压缩为空）。
+func waitGroupDrained(t *testing.T, b *Broker, group string, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		for _, msgs := range b.groups[group].keyMsgs {
+			if len(msgs) != 0 {
+				return false
+			}
+		}
+		return true
+	}, timeout, "group "+group+" drained")
+}

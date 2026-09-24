@@ -40,13 +40,11 @@ func TestRetryThenSuccess(t *testing.T) {
 		t.Fatalf("attempts at success = %v, want [3]", attemptsSeen)
 	}
 	attMu.Unlock()
+	// 业务先生效，框架在处理器返回后才把 ACK 落盘；等待确认落盘再断言。
+	waitStatus(t, b, "g", res.ID, stAcked, 3*time.Second)
 	b.mu.Lock()
-	st := b.groups["g"].byID[res.ID].status
 	at := b.groups["g"].byID[res.ID].attempts
 	b.mu.Unlock()
-	if st != stAcked {
-		t.Fatalf("status=%s want acked", st)
-	}
 	if at != 3 {
 		t.Fatalf("attempts=%d want 3", at)
 	}
