@@ -249,6 +249,7 @@ go test ./mq/ -race -count=20
 | `TestRestartInflightRedelivered` | 处理中硬崩溃（绕过优雅关闭）后未确认消息重投且不重复 |
 | `TestRestartRetryStatePreserved` | 重试状态 / 尝试次数跨重启保留 |
 | `TestConsumerScaleOutAndIn` | 消费组扩容、缩容，无双重成功、无丢失 |
+| `TestConsumerRemovalStuckHandler` | 缩容时处理器卡死：超时收回在途消息并立即重投，不悬挂、不重复 |
 | `TestIndependentGroups` | 多消费组各自独立消费一次 |
 | `TestGracefulShutdownInFlight` | 优雅关闭处理好在途消息，ACK 已落盘 |
 | `TestShutdownTimeoutForceCancel` | 处理器卡死时关闭不被阻塞，未确认消息重启重投 |
