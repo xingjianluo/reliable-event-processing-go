@@ -138,6 +138,11 @@ func (r *runner) hasWorkLocked() bool {
 	if r.b.closed {
 		return true
 	}
+	if r.g.paused[r.key] {
+		// 暂停期间无事可做：新消息与到期重试都保持排队，
+		// 直到 Resume / 关闭唤醒。
+		return false
+	}
 	if owner := r.g.ownerOf(r.key); owner == nil {
 		return false
 	}
@@ -146,12 +151,11 @@ func (r *runner) hasWorkLocked() bool {
 		if ms.status == stAcked || ms.status == stDead {
 			continue
 		}
+		// 第一个未完成消息即队头：严格按序，只看队头是否可投递。
 		if ms.status == stInflight {
 			return true
 		}
-		if !ms.notBefore.After(now) {
-			return true
-		}
+		return !ms.notBefore.After(now)
 	}
 	return false
 }
@@ -190,6 +194,10 @@ func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}
 	if owner == nil {
 		return
 	}
+	if r.g.paused[r.key] {
+		// 暂停：不投递也不安排重试计时；Resume 会唤醒重新评估。
+		return
+	}
 	msgs := r.g.keyMsgs[r.key]
 	now := time.Now()
 	var next *msgState
@@ -198,14 +206,14 @@ func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}
 		if ms.status == stAcked || ms.status == stDead {
 			continue
 		}
+		// 第一个未完成消息即队头。严格按序：队头未到期时只安排
+		// 重试计时，绝不让后面的消息越过队头先行投递。
 		if ms.status == stInflight {
 			return
 		}
 		if ms.notBefore.After(now) {
-			if earliest.IsZero() || ms.notBefore.Before(earliest) {
-				earliest = ms.notBefore
-			}
-			continue
+			earliest = ms.notBefore
+			break
 		}
 		next = ms
 		break

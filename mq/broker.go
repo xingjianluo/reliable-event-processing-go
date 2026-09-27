@@ -84,6 +84,8 @@ type groupState struct {
 	keyMsgs map[string][]*msgState
 	byID    map[string]*msgState
 	runners map[string]*runner // key -> runner
+	// 暂停的路由键集合（持久化，跨重启保留）。
+	paused map[string]bool
 	// 死信（保持追加顺序）。
 	dead []*msgState
 }
@@ -168,6 +170,13 @@ func (b *Broker) replay() error {
 				return err
 			}
 			b.applyGroupEvent(rec.Kind, &e)
+		case kindPause:
+			var e pauseEvent
+			if err := json.Unmarshal(rec.Data, &e); err != nil {
+				return err
+			}
+			g := b.ensureGroup(e.Group)
+			g.paused[e.Key] = e.Paused
 		default:
 			// 未知记录类型跳过，保持前向兼容。
 		}
@@ -184,6 +193,7 @@ func (b *Broker) ensureGroup(name string) *groupState {
 			keyMsgs:   map[string][]*msgState{},
 			byID:      map[string]*msgState{},
 			runners:   map[string]*runner{},
+			paused:    map[string]bool{},
 		}
 		b.groups[name] = g
 	}
