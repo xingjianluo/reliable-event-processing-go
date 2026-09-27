@@ -132,11 +132,15 @@ func (r *runner) run() {
 	}
 }
 
-// hasWorkLocked 判断是否应结束等待重新评估：关闭、有立即可投递消息、
-// 或已安排的重试计时已经到期。
+// hasWorkLocked 判断是否应结束等待重新评估：关闭、队头消息可立即投递、
+// 或队头处于在途。只看队头（最早未完成消息）：队头延期等待时，后续消息
+// 不得越过它，重试到期由已安排的计时器唤醒。
 func (r *runner) hasWorkLocked() bool {
 	if r.b.closed {
 		return true
+	}
+	if r.g.paused[r.key] {
+		return false
 	}
 	if owner := r.g.ownerOf(r.key); owner == nil {
 		return false
@@ -146,12 +150,8 @@ func (r *runner) hasWorkLocked() bool {
 		if ms.status == stAcked || ms.status == stDead {
 			continue
 		}
-		if ms.status == stInflight {
-			return true
-		}
-		if !ms.notBefore.After(now) {
-			return true
-		}
+		// 队头：在途或可立即投递才算有工作；延期等待由计时器负责唤醒。
+		return ms.status == stInflight || !ms.notBefore.After(now)
 	}
 	return false
 }
@@ -190,6 +190,11 @@ func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}
 	if owner == nil {
 		return
 	}
+	// 暂停：新消息与到期重试都继续排队，不投递、不安排重试计时
+	// （恢复时会显式唤醒重新评估）。
+	if r.g.paused[r.key] {
+		return
+	}
 	msgs := r.g.keyMsgs[r.key]
 	now := time.Now()
 	var next *msgState
@@ -198,14 +203,14 @@ func (r *runner) tryDeliverLocked(timer **time.Timer, timerCancel *chan struct{}
 		if ms.status == stAcked || ms.status == stDead {
 			continue
 		}
+		// 队头（最早未完成消息）决定一切：在途则等裁决，延期则等到期，
+		// 后续消息一律不得越过队头（同键严格有序）。
 		if ms.status == stInflight {
 			return
 		}
 		if ms.notBefore.After(now) {
-			if earliest.IsZero() || ms.notBefore.Before(earliest) {
-				earliest = ms.notBefore
-			}
-			continue
+			earliest = ms.notBefore
+			break
 		}
 		next = ms
 		break

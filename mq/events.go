@@ -9,7 +9,15 @@ const (
 	kindAcked     = "acked"     // 某消费组确认某消息
 	kindNacked    = "nacked"    // 某消费组拒绝某消息（安排重试）
 	kindDead      = "dead"      // 某消费组将某消息打入死信
+	kindPause     = "pause"     // 某消费组暂停/恢复某路由键的投递
 )
+
+// pauseEvent: 某消费组对某路由键的暂停/恢复控制。状态持久化，跨重启保持。
+type pauseEvent struct {
+	Group  string `json:"g"`
+	Key    string `json:"k"`
+	Paused bool   `json:"p"`
+}
 
 // groupRegEvent: 消费组首次注册。
 type groupRegEvent struct {

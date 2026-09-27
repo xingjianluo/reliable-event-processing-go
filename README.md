@@ -139,7 +139,66 @@ res, _ := broker.Publish(ctx,
 
 ---
 
-## 5. 持久化与重启恢复
+## 5. 按路由键的投递控制（暂停 / 恢复 / 运行态快照）
+
+线上排障时可以按 `(消费组, 路由键)` 临时停下一条业务线，确认积压与
+等待原因后再放行，且不破坏同键顺序。
+
+### 暂停与恢复
+
+```go
+_ = broker.Pause("orders", "worker-1")  // 暂停 (orders 组, worker-1 键)
+snap := broker.KeyStatus("orders", "worker-1") // 查看运行态快照
+_ = broker.Resume("orders", "worker-1") // 显式恢复
+```
+
+- **暂停（`Pause`）**：该键的新消息与**已经到期的重试**都继续排队，
+  不交给处理器；已在途的消息允许跑完并落盘裁决（不收回、不取消）。
+  其他路由键、其他消费组完全不受影响，不会互相拖慢。
+- **恢复（`Resume`）**：从该键**最早未完成**的消息继续投递，后续消息
+  严格排在其后，不会插到前面。
+- 暂停状态先写 WAL（`pause` 记录）再生效，**跨重启保留**：重启后仍
+  保持暂停，直到显式 `Resume`。`Pause` / `Resume` 均幂等，重复调用
+  不产生额外日志记录。
+- 暂停只作用于指定 `(消费组, 路由键)`；同一键在别的消费组、同组内
+  其他键都正常消费。
+
+### 运行态快照（`KeyStatus`）
+
+`KeyStatus(group, key)` 返回只读快照 `KeySnapshot`，用于直接判断
+“为什么没往下走”：
+
+| 字段 | 含义 |
+| --- | --- |
+| `Exists` | 该 `(group, key)` 是否有消息记录 |
+| `Paused` | 是否处于暂停状态 |
+| `State` | `ready` / `processing` / `waiting_retry` / `paused` / `no_consumer` / `drained` |
+| `WaitReason` | 未推进原因：`none` / `paused` / `retry_delay` / `in_flight` / `no_consumer` |
+| `HeadID` / `HeadSeq` / `HeadAttempts` | 最早未完成消息的 ID、序号与已尝试次数 |
+| `HeadNotBefore` | 队头预计下次可投递时间（零值 = 立即可投递） |
+| `Backlog` | 队头之后尚未完成的消息条数（不含队头） |
+
+语义保证：
+
+- **未完成 = 未确认且未死信**。快照绝不会把尚未成功的消息显示成
+  已处理；全部终态后报告 `drained`。
+- 读取只在持锁瞬间拷贝状态，**不会打断**正在进行的消费，也不改变
+  任何投递行为；常见积压规模下读取为一次线性扫描，无额外持久化开销。
+- 暂停与重试叠加时，`State` 优先报告 `paused`（暂停是更直接的可干预
+  原因），`HeadNotBefore` 仍给出重试到期时间。
+
+### 与既有行为的兼容边界
+
+- 暂停 / 恢复与延期重试、扩缩容、进程重启可任意叠加：同键严格按序、
+  至少一次、已确认消息不重投、不重复成功提交的语义全部保持不变。
+- 缩容收回的在途消息回到 pending 后，若键已暂停则继续排队，恢复后
+  仍从队头按序重投。
+- 旧版本数据目录**完全兼容**：`pause` 是新记录类型，旧日志中没有它，
+  重放时等价于“从未暂停”；未知记录类型重放时跳过，前向兼容。
+
+---
+
+## 6. 持久化与重启恢复
 
 ### WAL
 
@@ -148,7 +207,8 @@ res, _ := broker.Publish(ctx,
 - 帧：`magic | seq | kindLen | dataLen | kind | data | crc32`（大端），
   CRC32(IEEE) 覆盖序号与负载。
 - 记录类型：`group`（消费组注册）、`published`（消息发布）、
-  `acked` / `nacked` / `dead`（消费组级状态变迁）。
+  `acked` / `nacked` / `dead`（消费组级状态变迁）、
+  `pause`（按路由键暂停 / 恢复投递）。
 - 每条 `published` 消息负载只存一份；各消费组通过 `(key, seq)` 引用，
   并各自维护投递状态。
 - 打开时重放全部记录重建内存。遇到**异常退出残留的撕裂尾帧**
@@ -181,7 +241,7 @@ NACK（等待重试中）崩溃时，尝试次数与到期时间已持久化，�
 
 ---
 
-## 6. 配置项（`mq.Config`）
+## 7. 配置项（`mq.Config`）
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -196,7 +256,7 @@ NACK（等待重试中）崩溃时，尝试次数与到期时间已持久化，�
 
 ---
 
-## 7. 可观测日志
+## 8. 可观测日志
 
 默认日志逐条打印**消息标识、路由键、尝试次数与状态迁移**，例如：
 
@@ -215,7 +275,7 @@ DECISION-IGNORE id=... status=acked (stale)
 
 ---
 
-## 8. 本地验证方法
+## 9. 本地验证方法
 
 要求 Go 1.25+（开发环境为 Go 1.26）。
 
@@ -254,6 +314,11 @@ go test ./mq/ -race -count=20
 | `TestGracefulShutdownInFlight` | 优雅关闭处理好在途消息，ACK 已落盘 |
 | `TestShutdownTimeoutForceCancel` | 处理器卡死时关闭不被阻塞，未确认消息重启重投 |
 | `TestHeadOfLineOrdering` | 队头阻塞验证严格顺序 |
+| `TestPauseBlocksDeliveryOtherKeysUnaffected` | 暂停后该键不投递、他键不受影响；恢复快照与按序补齐 |
+| `TestPausedKeyWithDelayedRetryHead` | 队头延期重试 + 暂停叠加：到期不投递、后续不越过；恢复后按序 |
+| `TestPausePersistsAcrossRestart` | 暂停状态跨重启保留，显式恢复后按序处理 |
+| `TestKeyStatusStates` | 快照各状态（处理中 / 无消费者 / 已清空 / 不存在）与字段正确性 |
+| `TestPauseWithConsumerRemoval` | 暂停 + 缩容收回在途叠加：不重投、恢复后按序完成 |
 | `TestStressScaleAndFailures` | 600 消息 / 24 键 / 动态扩缩容 / 混合失败：成功 + 死信恰好覆盖全部且无重复 |
 | `mq/wal` 包测试 | 追加 / 重放、序号连续、撕裂尾帧截断恢复 |
 
@@ -261,7 +326,7 @@ go test ./mq/ -race -count=20
 
 ---
 
-## 9. 设计边界与权衡（明确不做的事）
+## 10. 设计边界与权衡（明确不做的事）
 
 - 单进程、单数据目录（`flock` 保证）；不是网络多副本队列。
 - 同键严格有序意味着**队头阻塞**：一条消息持续重试会延后同键后续消息，
