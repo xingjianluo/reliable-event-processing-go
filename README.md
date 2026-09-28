@@ -187,6 +187,41 @@ _ = broker.Resume("orders", "worker-1") // 显式恢复
 - 暂停与重试叠加时，`State` 优先报告 `paused`（暂停是更直接的可干预
   原因），`HeadNotBefore` 仍给出重试到期时间。
 
+#### 运行态读取与 ACK 落盘的语义边界（重要）
+
+快照反映的是 **broker 的已提交状态**，而不是业务处理器的进度，两者
+之间有一个真实且不可消除的窗口：
+
+```text
+处理器执行完业务副作用（eff.mark / 数据库已提交）
+        │  ← 业务已生效，但 ACK 尚未落盘：
+        │     快照仍可能读到 processing（inflight）
+        ▼
+处理器返回 Decision → runner 追加 ACK 到 WAL 并 fsync → 内存置为 acked
+        │
+        ▼
+此后 KeyStatus 才会把该消息从“未完成”里移除，最终报告 drained
+```
+
+因此：
+
+- **“处理器已返回 / 业务副作用已生效”不等于 drained。** 在
+  inflight→acked 的窗口里（竞态检测或机器有负载时该窗口会被拉长）
+  读到 `processing` 是正确、如实的反映，而不是脏读。
+- `drained` 是**单调终态**：一旦观察到，就说明所有消息都已有落盘的
+  终态裁决（ACK 或死信），不会再回退。需要“这批消息已可靠完成”判据
+  的调用方（包括自动化测试），应**轮询 `KeyStatus` 直到 `State ==
+  StateDrained`**，而不是以处理器返回计数来断言，也不要用固定长 sleep
+  去赌 ACK 已经落盘。
+- 快照本身是**线性一致**的：状态枚举、`HeadSeq`、`Backlog`、
+  `WaitReason` 来自同一临界区，绝不会出现“队头还在途却显示 drained”
+  这类自相矛盾的组合。跨多次读取观察到 `processing → ready → drained`
+  的推进是正常的；在重试到期到 runner 重新投递之间还可能短暂读到
+  `ready`，同样是合法瞬间。
+- 读取**不获取任何投递相关资源、不取消在途、不改变重试计时**，因此
+  高频并发读取不会拖慢或打断正在进行的消费（由
+  `TestKeyStatusConcurrent*` 系列在 `-race` 下反复验证）。
+
 ### 与既有行为的兼容边界
 
 - 暂停 / 恢复与延期重试、扩缩容、进程重启可任意叠加：同键严格按序、
@@ -290,9 +325,31 @@ go test ./... -count=1 -v
 # race detector（要求必须稳定通过）
 go test ./... -race -count=1
 
-# 压力 / 稳定性：重复多轮
-go test ./mq/ -race -count=20
+# 压力 / 稳定性：暂停·恢复·运行态这批并发用例重复多轮（本机已按 100 轮验证）
+go test ./mq/ -race -count=20 -run 'TestPause|TestKeyStatus'
+
+# 高强度回归：整包重复 30 轮竞态检测
+go test ./... -race -count=30
+
+# 机器有额外负载时同样验证（可选；制造 CPU 负载后再跑）
+yes > /dev/null &       # 可开多个；验证结束后 kill
+go test ./mq/ -race -count=10 -run 'TestPause|TestKeyStatus'
 ```
+
+**通过判据**：上述命令都必须以 `ok` 退出、无 `DATA RACE` 报告，且在
+高重复轮次、`-race`、外加 CPU 负载下都不允许出现随机失败。尤其要满足：
+
+1. 暂停期间该键**零投递**（到期重试也不放行），恢复后从最早未完成消息
+   按序补齐，每条恰好生效一次；
+2. 业务已全部生效后，运行态读取若仍为 `processing` 不判失败——测试统一
+   轮询到 ACK 落盘后的单调终态 `drained` 才断言，不用固定长 sleep 碰运气；
+3. 任意时刻（在途、重试等待、暂停/恢复、扩缩容）的快照都自洽，绝不把
+   未确认消息报告成已完成；读取不打断消费。
+
+> 本轮修复的随机失败正源于判据 2 的反面：旧用例等到“业务计数到齐”后
+> 立刻断言 `drained`，在竞态检测/高负载下会踩中“业务已生效但最后一个
+> ACK 还在 fsync”的窗口而读到 `processing`。修复方式是把同步点改为
+> 等待已提交终态，**没有放宽或删除任何语义断言，也没有单纯拉长等待**。
 
 ### 测试覆盖一览
 
@@ -319,10 +376,16 @@ go test ./mq/ -race -count=20
 | `TestPausePersistsAcrossRestart` | 暂停状态跨重启保留，显式恢复后按序处理 |
 | `TestKeyStatusStates` | 快照各状态（处理中 / 无消费者 / 已清空 / 不存在）与字段正确性 |
 | `TestPauseWithConsumerRemoval` | 暂停 + 缩容收回在途叠加：不重投、恢复后按序完成 |
+| `TestKeyStatusConcurrentReadsWhileInflight` | 队头在途时多 goroutine 连读：同锁交叉校验快照自洽、读取不打断消费 |
+| `TestKeyStatusConcurrentReadsThroughoutDrain` | 整批排空期间持续读取：业务生效与 ACK 落盘窗口内绝不误报 drained |
+| `TestKeyStatusReadsDuringPauseAndScale` | 多轮暂停/恢复与扩缩容叠加，全程并发读：暂停零投递、恢复按序、最终恰好一次 |
+| `TestKeyStatusConcurrentReadsDuringDelayedHead` | 队头延期重试期间并发读：到期前恒为 waiting_retry，到期补齐不被读取干扰 |
 | `TestStressScaleAndFailures` | 600 消息 / 24 键 / 动态扩缩容 / 混合失败：成功 + 死信恰好覆盖全部且无重复 |
 | `mq/wal` 包测试 | 追加 / 重放、序号连续、撕裂尾帧截断恢复 |
 
-所有测试在 `-race` 下稳定通过（已重复 20 轮验证）。
+所有测试在 `-race` 下稳定通过：暂停/运行态这批并发用例已按 **100 轮**
+重复竞态验证，整包已按 **30 轮**重复竞态验证，并在外加 CPU 负载下
+复测通过。
 
 ---
 

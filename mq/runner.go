@@ -373,19 +373,23 @@ func (r *runner) revokeInflight(cause string) {
 }
 
 // revokeInflightLocked 是 revokeInflight 的持锁版本。调用方必须持有 b.mu。
+// 顺序很重要：先取消处理器 context，再把 inflight 置空。这样等待方一旦在
+// 锁内观察到“该 runner 已无在途”，就必然能同时观察到 context 已取消，
+// 不会读到“inflight 已清空但取消还没执行”的中间态。
 func (r *runner) revokeInflightLocked(cause string) {
 	ms := r.inflight
 	if ms == nil {
 		return
 	}
-	if ms.status == stInflight {
-		ms.status = stPending
-	}
-	r.inflight = nil
+	// 先取消处理器（context.CancelFunc 非阻塞，仅标记取消）。
 	if r.cancelDelivery != nil {
 		r.cancelDelivery()
 		r.cancelDelivery = nil
 	}
+	if ms.status == stInflight {
+		ms.status = stPending
+	}
+	r.inflight = nil
 	r.decisionCh = nil
 	if r.revokeCh != nil {
 		close(r.revokeCh) // 解除在途 select 的等待

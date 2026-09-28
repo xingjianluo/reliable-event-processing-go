@@ -117,10 +117,21 @@ func (b *Broker) Resume(group GroupName, key RoutingKey) error {
 // KeyStatus 返回指定（消费组, 路由键）的运行态快照。
 // 未完成的定义是“未确认且未死信”；快照绝不会把未成功消息显示为已处理。
 // 读取只在持锁瞬间拷贝状态，不会打断正在进行的消费。
+//
+// 语义边界：快照反映的是 broker 的已提交状态，而不是业务处理器的进度。
+// 处理器返回（业务生效）与 ACK 经 WAL fsync 落盘之间存在窗口，该窗口内
+// 队头状态仍为 processing；只有 ACK/死信落盘、内存状态进入终态后才会
+// 报告 drained。需要“已可靠完成”判据的调用方应轮询 State==StateDrained，
+// 而不是以处理器返回来判定。
 func (b *Broker) KeyStatus(group GroupName, key RoutingKey) KeySnapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.keyStatusLocked(group, key, time.Now())
+}
 
+// keyStatusLocked 是 KeyStatus 的持锁版本，now 由调用方在临界区内给定，
+// 保证“到期判定”与状态拷贝基于同一时刻。调用方必须持有 b.mu。
+func (b *Broker) keyStatusLocked(group GroupName, key RoutingKey, now time.Time) KeySnapshot {
 	snap := KeySnapshot{Group: group, Key: key}
 	g := b.groups[group]
 	if g == nil {
@@ -169,7 +180,6 @@ func (b *Broker) KeyStatus(group GroupName, key RoutingKey) KeySnapshot {
 	snap.HeadAttempts = head.attempts
 	snap.Backlog = backlog
 
-	now := time.Now()
 	switch {
 	case snap.Paused:
 		// 暂停优先报告：这是“没往下走”的直接原因。
