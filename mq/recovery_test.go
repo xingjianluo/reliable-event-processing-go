@@ -126,14 +126,19 @@ func TestRestartRetryStatePreserved(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(t, dir)
 	cfg.MaxAttempts = 4
-	cfg.RetryDelay = 5 * time.Millisecond
+	// 重启前的重试窗口必须足够宽：要保证“观察到 2 次拒绝 -> 优雅关闭”
+	// 确定发生在第 3 次投递之前。否则在调度严重受限时第 3 次投递可能
+	// 在关闭前于旧 broker 内直接死信，重启后死信由日志重放恢复、
+	// 新处理器根本不会被调用，用例就测不到“重启后 attempt 累计”。
+	cfg.RetryDelay = 500 * time.Millisecond
+	cfg.MaxRetryDelay = time.Second
 
 	b, _ := OpenBroker(cfg)
 	var nackedBefore atomic.Int32
 	c, _ := b.Subscribe("g", "c1", func(ctx context.Context, d *Delivery) Decision {
 		if d.Attempt() <= 2 {
 			nackedBefore.Add(1)
-			return RetryDecision(errors.New("t"), 5*time.Millisecond)
+			return RetryDecision(errors.New("t"), 500*time.Millisecond)
 		}
 		return DropDecision(errors.New("give up"))
 	})

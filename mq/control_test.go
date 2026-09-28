@@ -62,6 +62,9 @@ func TestPauseBlocksDeliveryOtherKeysUnaffected(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return eff.total() == 5 }, 2*time.Second, "k1 drained after resume")
+	// 业务先生效，ACK 在处理器返回后才 fsync 落盘：
+	// 等到运行态真正进入 drained（终态不回退）再断言，而非业务计数刚到就读。
+	waitKeyState(t, b, "g", "k1", StateDrained, 2*time.Second)
 	mu.Lock()
 	defer mu.Unlock()
 	for i, s := range order["k1"] {
@@ -250,6 +253,8 @@ func TestKeyStatusStates(t *testing.T) {
 	}
 	close(release)
 	waitFor(t, func() bool { return eff.total() == 2 }, 2*time.Second, "drained")
+	// 与上同理：业务生效不等于 ACK 已落盘，等待运行态到达 drained 终态。
+	waitKeyState(t, b, "g", "k", StateDrained, 2*time.Second)
 	if got := b.KeyStatus("g", "k"); got.State != StateDrained || got.WaitReason != ReasonNone {
 		t.Fatalf("drained snapshot = %+v", got)
 	}

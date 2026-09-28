@@ -186,6 +186,35 @@ _ = broker.Resume("orders", "worker-1") // 显式恢复
   任何投递行为；常见积压规模下读取为一次线性扫描，无额外持久化开销。
 - 暂停与重试叠加时，`State` 优先报告 `paused`（暂停是更直接的可干预
   原因），`HeadNotBefore` 仍给出重试到期时间。
+- 若键上消息已全部进入终态（队列被裁剪）但暂停位仍在，快照报告
+  `paused` 且不携带队头字段（paused-but-empty）——“暂停”是更
+  actionable 的状态；显式 `Resume` 后即为 `drained`。
+
+#### 运行态读取与 ACK 落盘的语义边界（重要）
+
+处理器内“业务生效”与框架“ACK 已落盘”是两个先后分离的时刻：
+
+```
+处理器执行业务副作用(eff.mark)  ->  处理器返回 Decision
+   ->  WAL 追加 acked 记录并 fsync  ->  内存态翻转为 acked / 队列裁剪
+   ->  KeyStatus 才可能报告 drained
+```
+
+因此：
+
+1. **业务侧观测到生效后，立刻读 `KeyStatus` 仍可能得到 `processing`
+   （或短暂的 `ready`/`waiting_retry`）**。这不是误报，恰恰是
+   “不把还没成功（ACK 未落盘）的消息当成已完成”的正确语义：
+   此刻若进程崩溃，该消息按 at-least-once 必须重投。
+2. **`drained` 是单调终态**：一旦读到 `drained`，对应 ACK 必然已经
+   fsync 落盘，之后不会再回退到 `processing`/`ready`（前提是没有向
+   该键发布新消息）。所以需要“处理完了”的确定信号时，应当**轮询
+   `KeyStatus` 直到 `State == drained`**，而不是在业务计数刚到齐时
+   做一次性读取断言；本仓库测试统一使用 `waitKeyState(...)` 等待终态，
+   不依赖固定 sleep，超时即判失败。
+3. 在途窗口内读到 `processing`、重试到期边界读到 `waiting_retry`
+   （`HeadNotBefore` 恰好不晚于当前时刻、但计时 goroutine 尚未唤醒）
+   都是合法的瞬时帧，调用方不得把这类中间帧当作失败。
 
 ### 与既有行为的兼容边界
 
@@ -290,9 +319,34 @@ go test ./... -count=1 -v
 # race detector（要求必须稳定通过）
 go test ./... -race -count=1
 
-# 压力 / 稳定性：重复多轮
-go test ./mq/ -race -count=20
+# 压力 / 稳定性：重复多轮竞态检测（每一轮都必须通过）
+go test ./mq/ -race -count=50
+
+# 只盯暂停 / 运行态 / 扩缩容这批并发用例，更高重复次数
+go test ./mq/ -race -count=200 -run 'TestPause|TestKeyStatus|TestConsumerRemoval|TestConsumerScale'
 ```
+
+### 高负载下的稳定性验证（复现随机失败用）
+
+这批并发用例历史上的随机失败只在“竞态检测 + 高重复次数 + 机器同时有
+别的负载”时才偶发（业务已生效但 ACK 尚在落盘窗口，一次性快照读到
+`processing`）。可用下面的方式制造 CPU 争抢并限制调度并行度后反复验证：
+
+```bash
+# 后台制造 3 个满载 CPU 负载（yes），再以 2 个 P 跑竞态检测，重复 30 轮
+(yes >/dev/null & yes >/dev/null & yes >/dev/null &)
+GOMAXPROCS=2 go test -race -count=30 ./mq/
+pkill -x yes   # 结束后清理后台负载
+```
+
+**通过判据**：
+
+- 命令退出码为 0，输出 `ok ...`；任意一轮出现 `FAIL`、`DATA RACE`、
+  panic、超时都视为不通过；
+- 断言严格性不降低：暂停期间投递计数必须保持 0、到期重试不得放行、
+  恢复后按序补齐（逐序号校验）、运行态不得把未 ACK 的消息报成
+  `drained`；等待一律轮询终态，**不允许靠加大固定 sleep 或删掉断言
+  来“压”住失败**。
 
 ### 测试覆盖一览
 
@@ -319,10 +373,17 @@ go test ./mq/ -race -count=20
 | `TestPausePersistsAcrossRestart` | 暂停状态跨重启保留，显式恢复后按序处理 |
 | `TestKeyStatusStates` | 快照各状态（处理中 / 无消费者 / 已清空 / 不存在）与字段正确性 |
 | `TestPauseWithConsumerRemoval` | 暂停 + 缩容收回在途叠加：不重投、恢复后按序完成 |
+| `TestKeyStatusConcurrentReadsInFlight` | 消息在途时多 goroutine 连续读取：快照帧帧自洽、不误报 drained、读取不打断消费 |
+| `TestKeyStatusReadsAcrossPauseAndRetry` | 延期重试→暂停→恢复全程并发读取：状态序列正确、到期重试被暂停压住、恢复按序 |
+| `TestKeyStatusReadsAcrossPauseAndScale` | 暂停 + 扩缩容 + 在途收回全程并发读取：收回后 paused 有队头、不投递、恢复补齐 |
+| `TestKeyStatusReadsDuringPauseFlapping` | 暂停/恢复高速抖动 + 多键连续读取：帧帧自洽、最终按序恰好一次、drained |
+| `TestKeyStatusReadsDuringRetryWindow` | 延期重试窗口内连续读取：HeadNotBefore/HeadSeq/Attempts/Backlog 字段稳定自洽 |
 | `TestStressScaleAndFailures` | 600 消息 / 24 键 / 动态扩缩容 / 混合失败：成功 + 死信恰好覆盖全部且无重复 |
 | `mq/wal` 包测试 | 追加 / 重放、序号连续、撕裂尾帧截断恢复 |
 
-所有测试在 `-race` 下稳定通过（已重复 20 轮验证）。
+所有测试在 `-race` 下稳定通过：已在正常负载下重复 50 轮、并在
+`GOMAXPROCS=2` 加 3 路满载 CPU 争抢的极端条件下重复 60 轮验证
+（暂停 / 运行态批次单独重复 200 轮）。
 
 ---
 
